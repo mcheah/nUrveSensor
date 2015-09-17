@@ -1,0 +1,215 @@
+ #include <SPI.h>
+ #include <SD.h>
+ #include <Wire.h>
+ #include <Adafruit_Sensor.h>
+ #include <Adafruit_ADXL345_U_Due.h>
+ #include "Adafruit_HTU21DF_Due.h"     // Temperature and Humidity Sensor - HTU21D-F
+ #include "Adafruit_TSL2561_U_Due.h"   // Light Sensor - TSL2561
+ #include <Adafruit_GPS.h>
+ #include <DueTimer.h>
+ 
+Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(2, 4, 3, 5, 12345);  //3-axis accelerometer
+#define AUDIO_BUFFER_SIZE 40000  //Number of 8 or 16 bit samples in a ring buffer for full audio capture
+#define ADC_RES 12               //ADC Resolution
+#define AUDIO_PERIOD 100         //Audio Sampling Period in microseconds
+#define AUDIO_CHANNEL A0         //Analog ADC Channel
+#define ACCEL_PERIOD 10000       //Accelerometer Sampling period in microseconds
+#define ACCEL_BUFFER_SIZE 600    //Number of 16-bit samples in a ring buffer for full accelerometer capture
+#define FULL_DATA_LOG 0          //Unused
+#define SD_PERIOD 2000           //Time period for writing samples to SD card in milliseconds
+#define GPSPort Serial1          //Hardware Serial port used for the GPS module
+
+#define TIMESTAMP_LENGTH   20    //Number of characters in the timestamp string buffer
+#define LOCATION_LENGTH    19    //Number of characters in the location string buffer
+
+Adafruit_GPS GPS(&GPSPort);      //MT3339 GPS Module from Adafruit
+Adafruit_HTU21DF htu = Adafruit_HTU21DF();    //Temp and Humidity unit from Adafruit
+Adafruit_TSL2561_Unified  tsl = Adafruit_TSL2561_Unified(TSL2561_ADDR_FLOAT, 12345);  //Luminance sensor from adafruit
+File logfile;
+
+//Ring Buffers for capturing samples
+#if ADC_RES>8
+uint16_t audio_buff[AUDIO_BUFFER_SIZE];  
+#else
+uint8_t audio_buff[AUDIO_BUFFER_SIZE];  //If ADC resolution is 8 bits or less, save RAM space
+#endif
+int16_t X_buff[ACCEL_BUFFER_SIZE];
+int16_t Y_buff[ACCEL_BUFFER_SIZE];
+int16_t Z_buff[ACCEL_BUFFER_SIZE];
+int16_t accel_buff[ACCEL_BUFFER_SIZE];
+
+uint32_t audio_rx_index = 0;  //Next index to receive a new audio sample
+uint32_t audio_tx_index = 0;  //Next index to write audio sample to SD
+uint32_t audio_sum = 0;       //Sum of all audio data in the window being averaged
+uint32_t audio_max = 0;       //Max of all audio data in the window being averaged
+uint32_t audio_count = 0;     //Total number of samples captured in the window being averaged.  This will vary due to timing differences and GPS acquisition time.
+
+uint32_t accel_rx_index = 0;   //Next index to receive a new accel sample
+uint32_t accel_tx_index = 0;   //Next index to write accel sample to SD
+uint32_t accel_sum = 0;        //Sum of all accel data in the window being averaged
+uint32_t accel_max = 0;        //Max of all accel data in the window being averaged
+uint32_t accel_count = 0;      //Total number of samples captured in the window being averaged.  This will vary due to timing differences and GPS acquisition time.
+
+float AMB_Temp = -9999;        //Temp Sensor Value
+float AMB_Humd = -9999;        //Humidity Sensor Value
+float AMB_Lux = -9999;         //Luminance Sensor Value
+
+int last_starttime = 0;        //Counter for measuring the SD interval
+
+void setup() {
+  //Initialize pin levels to set everybody in a happy state.
+  //ADXL defaults to SPI if CS is not held high
+  pinMode(7,INPUT);
+  pinMode(8,INPUT);
+  pinMode(18,OUTPUT);
+  pinMode(19,INPUT);
+  Serial.begin(115200);
+  Wire1.setClock(25000);
+  pinMode(10, OUTPUT);
+  pinMode(5,OUTPUT);
+  digitalWrite(5,HIGH);
+  setupGPS();               // Initialize GPS module
+  setupAmbientTemp();       // Set up Ambient Sensor 1 - Temp & Humidity
+  setupAmbientLux();        // Set up Ambient Sensor 2 - Luminosity
+  setupRoadSensor();
+  setupDataLogger();
+  analogReadResolution(ADC_RES);  //Set ADC to 12-bit for higher resolution recordings
+  Timer3.attachInterrupt(audio_handler);  //Attach audio capture to Timer 3
+  Timer4.attachInterrupt(accel_handler);  //Attach accel capture to Timer 4
+  
+  Timer3.start(AUDIO_PERIOD);             //Start Timer 3
+  Timer4.start(ACCEL_PERIOD);             //Start Timer 4
+}
+
+void error(char *str)
+{
+  Serial.print("error: ");
+  Serial.println(str);
+  
+  // red LED indicates error
+  digitalWrite(13, HIGH);
+  
+  while(1);
+}
+
+void audio_handler()  //Runs at approximately 100uSec to log audio samples synchronously to memory
+{
+  audio_buff[audio_rx_index]= (analogRead(AUDIO_CHANNEL));  //Read Audio data to memory
+  audio_rx_index++;                                         //Increment Ring buffer index
+  audio_count++;                                            //Increment sample count
+  if(audio_rx_index>=AUDIO_BUFFER_SIZE)                     //Roll back around if we go past the end of the buffer
+    audio_rx_index=0;
+    
+  if(audio_buff[audio_rx_index]>audio_max)                  //Calculate Max
+    audio_max = audio_buff[audio_rx_index];
+    
+  audio_sum += pow((float)(audio_buff[audio_rx_index])-(1<<(ADC_RES-1)),2);  //Perform RMS Sum
+  //audio_sum+=abs((int16_t)(audio_buff[audio_rx_index])-(1<<(ADC_RES-1)));
+}
+
+void accel_handler()   //Runs at approximately 10mSec to log accel samples synchronously to memory
+{
+  //Get X/Y/Z Values
+  X_buff[accel_rx_index]= accel.getX();
+  Y_buff[accel_rx_index]= accel.getY();
+  Z_buff[accel_rx_index]= accel.getZ();
+  //Get absolute magnitude
+  accel_buff[accel_rx_index] = sqrt(pow(X_buff[accel_rx_index],2)+pow(Y_buff[accel_rx_index],2)+pow(Z_buff[accel_rx_index],2));
+  accel_rx_index++;  //Increment Ring buffer index
+  accel_count++;     //Increment Sample Count
+  if(accel_rx_index>=ACCEL_BUFFER_SIZE)    //Roll back around if we go past the end of the buffer
+    accel_rx_index=0;
+    
+ if(accel_buff[accel_rx_index]>accel_max)                 //Calculate Max
+    accel_max = accel_buff[accel_rx_index];    
+  accel_sum += accel_buff[accel_rx_index];
+}
+
+//Main loop's purpose is to acquire measurements for low-frequency sensors as well as log data intermittently to the SD card
+void loop() {
+    // Try to acquire a GPS location before we record data
+    bool gotGPS = false;
+    int xx = Serial1.available();  //Clear out the UART of stale data
+    char trash[256];
+    Serial1.readBytes(trash,xx);
+    //int starttime = millis();
+    //Serial.print("Interval ");Serial.println(starttime-last_starttime);
+    //last_starttime=starttime;    
+    while(!gotGPS)                 //Read errors are prevalent, so keep reading GPS Serial until we get a valid NMEA sentence
+    {
+    char c = GPS.read();           //Check for newline character
+    // if you want to debug, this is a good time to do it!
+    if (1)
+      if (c) Serial.print(c);
+  
+  // if a sentence is received, we can check the checksum, parse it...
+
+  if (GPS.newNMEAreceived()) 
+  {
+    //Serial.println("NMEA Received");
+    // a tricky thing here is if we print the NMEA sentence, or data
+    // we end up not listening and catching other sentences! 
+    // so be very wary if using OUTPUT_ALLDATA and trytng to print out data
+    //Serial.println(GPS.lastNMEA());   // this also sets the newNMEAreceived() flag to false
+  
+    if (!GPS.parse(GPS.lastNMEA()))   // this also sets the newNMEAreceived() flag to false
+    {
+      Serial.println("Parse Fail");
+      return;  // we can fail to parse a sentence in which case we should just wait for another
+    }
+    else
+    {
+      gotGPS=true;
+      char timestamp[TIMESTAMP_LENGTH + 1];
+      char location[LOCATION_LENGTH + 1];
+      int location_len = 0;
+      int timestamp_len = sprintf(timestamp, "20%02d-%02d-%02dT%02d:%02d:%02dZ,", GPS.year, GPS.month, GPS.day, GPS.hour, GPS.minute, GPS.seconds);
+        if(GPS.fix) {
+            location_len = sprintf(location, "%6.2f%c,%6.2f%c,", GPS.latitude, GPS.lat, GPS.longitude, GPS.lon);
+        } else {
+            location_len = sprintf(location, "Location,unknown,");
+        }
+        //Serial.println(timestamp);
+        //Serial.println(location);
+        // END OF GPS CODE
+      
+    
+        //Serial.println("Reading Lux");
+        //Serial.println(millis());
+        
+        //Capture low-frequency sensors
+        Timer4.stop();                  //SPI communication in the Accelerometer interrupt handler interferes with I2C communication
+        AMB_Temp = htu.readTemperature();
+        AMB_Humd = htu.readHumidity();
+        sensors_event_t event;
+        tsl.getEvent(&event);
+        if (event.light) {AMB_Lux = event.light;} else {AMB_Lux = -9998;}
+        //Calculate audio/accelerometer max/avg
+        uint32_t t_audio_sum = audio_sum;
+        uint32_t t_audio_count = audio_count;
+        uint32_t t_audio_max = audio_max;
+        uint32_t t_accel_sum = accel_sum;
+        uint32_t t_accel_count = accel_count;
+        uint32_t t_accel_max = accel_max;
+        //Reset counters for next window
+        audio_sum = 0;
+        audio_count = 0;
+        audio_max = 0;
+        accel_sum = 0;
+        accel_count = 0;
+        accel_max = 0;
+        uint32_t audio_avg = sqrt(t_audio_sum / t_audio_count);
+        uint32_t accel_avg = t_accel_sum / t_accel_count;
+        //uint32_t audio_avg = t_audio_sum / t_audio_count;
+        //Log all values to SD
+        logfile.print(timestamp);logfile.print(location);
+        logfile.print(t_audio_max);logfile.print(",");logfile.print(audio_avg);logfile.print(",");logfile.print(t_audio_sum);logfile.print(",");logfile.print(t_audio_count);logfile.print(",");
+        logfile.print(t_accel_max);logfile.print(",");logfile.print(accel_avg);logfile.print(",");logfile.print(t_accel_sum);logfile.print(",");logfile.print(t_accel_count);logfile.print(",");
+        logfile.print(AMB_Lux)    ;logfile.print(",");logfile.print(AMB_Humd) ;logfile.print(",");logfile.println(AMB_Temp);
+        logfile.flush();
+        Timer4.start(ACCEL_PERIOD);     //Restart Accelerometer interrupts
+        delay(SD_PERIOD);               //Wait until the end of the next time window
+        } //END If(NMEA Parse Success)
+      } //END If(NMEAReceived)
+    }  //END While(!GotGPS
+}
